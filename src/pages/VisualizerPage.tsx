@@ -386,7 +386,7 @@ const VisualizerPage = () => {
         return;
       }
 
-      // ── Streaming fetch: steps appear one-by-one as the AI generates them ──
+      // ── Smart fetch: streams when edge fn supports SSE, falls back to JSON ──
       const { data: { session } } = await supabase.auth.getSession();
       const authToken = session?.access_token ?? SUPABASE_ANON_KEY;
 
@@ -406,7 +406,6 @@ const VisualizerPage = () => {
       });
 
       if (!response.ok || !response.body) {
-        // Try to parse error JSON
         const errText = await response.text().catch(() => "Analysis failed");
         let errMsg = "Analysis failed";
         try { errMsg = (JSON.parse(errText) as { error?: string }).error ?? errMsg; } catch { /* */ }
@@ -418,89 +417,100 @@ const VisualizerPage = () => {
         return;
       }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      // sseBuf accumulates raw SSE bytes; ndjsonBuf accumulates extracted content tokens
-      let sseBuf = "";
-      let ndjsonBuf = "";
-      const collectedSteps: Step[] = [];
+      const contentType = response.headers.get("content-type") ?? "";
+      const isStreaming = contentType.includes("text/event-stream");
+
+      let collectedSteps: Step[] = [];
       let collectedOutput = "";
-      let stepCount = 0;
 
-      outer: while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      if (isStreaming) {
+        // ── SSE streaming path (new edge fn): steps appear one-by-one ──
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let sseBuf = "";
+        let ndjsonBuf = "";
+        let stepCount = 0;
 
-        sseBuf += decoder.decode(value, { stream: true });
-        // SSE lines are separated by \n
-        const sseLines = sseBuf.split("\n");
-        sseBuf = sseLines.pop() ?? "";
+        outer: while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        for (const sseLine of sseLines) {
-          if (!sseLine.startsWith("data: ")) continue;
-          const payload = sseLine.slice(6).trim();
-          if (payload === "[DONE]") break outer;
+          sseBuf += decoder.decode(value, { stream: true });
+          const sseLines = sseBuf.split("\n");
+          sseBuf = sseLines.pop() ?? "";
 
-          try {
-            const parsed = JSON.parse(payload) as { choices?: Array<{ delta?: { content?: string }; finish_reason?: string }> };
-            // Check for error in SSE payload
-            if ((parsed as unknown as { error?: { message?: string } }).error) {
-              const sseErr = (parsed as unknown as { error: { message?: string } }).error.message ?? "AI error";
-              toast.error(sseErr);
-              setOutput(`Error: ${sseErr}`);
-              break outer;
-            }
-            const token = parsed.choices?.[0]?.delta?.content;
-            if (!token) continue;
+          for (const sseLine of sseLines) {
+            if (!sseLine.startsWith("data: ")) continue;
+            const payload = sseLine.slice(6).trim();
+            if (payload === "[DONE]") break outer;
 
-            ndjsonBuf += token;
-
-            // Extract complete NDJSON lines from the buffer
-            const ndjsonLines = ndjsonBuf.split("\n");
-            ndjsonBuf = ndjsonLines.pop() ?? "";
-
-            for (const ndjsonLine of ndjsonLines) {
-              const trimmed = ndjsonLine.trim();
-              if (!trimmed) continue;
-              try {
-                const obj = JSON.parse(trimmed) as Record<string, unknown>;
-                if ("output" in obj) {
-                  collectedOutput = String(obj.output ?? "");
-                  setOutput(collectedOutput);
-                } else if ("step" in obj || "line" in obj) {
-                  const s = normalizeStep(obj, stepCount++);
-                  collectedSteps.push(s);
-                  // Add step immediately — UI updates progressively
-                  setSteps((prev) => [...prev, s]);
-                  setActiveStep(collectedSteps.length - 1);
-                }
-              } catch {
-                // Incomplete/malformed JSON line — skip
+            try {
+              const parsed = JSON.parse(payload) as { choices?: Array<{ delta?: { content?: string } }> };
+              if ((parsed as unknown as { error?: { message?: string } }).error) {
+                const sseErr = (parsed as unknown as { error: { message?: string } }).error.message ?? "AI error";
+                toast.error(sseErr);
+                setOutput(`Error: ${sseErr}`);
+                break outer;
               }
-            }
-          } catch {
-            // Malformed SSE chunk — skip
+              const token = parsed.choices?.[0]?.delta?.content;
+              if (!token) continue;
+
+              ndjsonBuf += token;
+              const ndjsonLines = ndjsonBuf.split("\n");
+              ndjsonBuf = ndjsonLines.pop() ?? "";
+
+              for (const ndjsonLine of ndjsonLines) {
+                const trimmed = ndjsonLine.trim();
+                if (!trimmed) continue;
+                try {
+                  const obj = JSON.parse(trimmed) as Record<string, unknown>;
+                  if ("output" in obj) {
+                    collectedOutput = String(obj.output ?? "");
+                    setOutput(collectedOutput);
+                  } else if ("step" in obj || "line" in obj) {
+                    const s = normalizeStep(obj, stepCount++);
+                    collectedSteps.push(s);
+                    setSteps((prev) => [...prev, s]);
+                    setActiveStep(collectedSteps.length - 1);
+                  }
+                } catch { /* incomplete JSON line */ }
+              }
+            } catch { /* malformed SSE chunk */ }
           }
         }
+
+        // Flush remaining buffer
+        if (ndjsonBuf.trim()) {
+          try {
+            const obj = JSON.parse(ndjsonBuf.trim()) as Record<string, unknown>;
+            if ("output" in obj) {
+              collectedOutput = String(obj.output ?? "");
+              setOutput(collectedOutput);
+            } else if ("step" in obj || "line" in obj) {
+              const s = normalizeStep(obj, stepCount++);
+              collectedSteps.push(s);
+              setSteps((prev) => [...prev, s]);
+              setActiveStep(collectedSteps.length - 1);
+            }
+          } catch { /* */ }
+        }
+      } else {
+        // ── JSON fallback path (current deployed edge fn) ──
+        const data = await response.json() as { steps?: unknown; output?: string; error?: string };
+        if (data?.error) {
+          toast.error(data.error);
+          setOutput(`Error: ${data.error}`);
+          setRunning(false);
+          return;
+        }
+        collectedSteps = normalizeSteps(data.steps);
+        collectedOutput = data.output || "";
+        setSteps(collectedSteps);
+        setActiveStep(collectedSteps.length ? collectedSteps.length - 1 : null);
+        setOutput(collectedOutput);
       }
 
-      // Flush any remaining buffered NDJSON content
-      if (ndjsonBuf.trim()) {
-        try {
-          const obj = JSON.parse(ndjsonBuf.trim()) as Record<string, unknown>;
-          if ("output" in obj) {
-            collectedOutput = String(obj.output ?? "");
-            setOutput(collectedOutput);
-          } else if ("step" in obj || "line" in obj) {
-            const s = normalizeStep(obj, stepCount++);
-            collectedSteps.push(s);
-            setSteps((prev) => [...prev, s]);
-            setActiveStep(collectedSteps.length - 1);
-          }
-        } catch { /* */ }
-      }
-
-      // Persist to local cache (cache-miss path only)
+      // Persist to local cache
       if (!hasRuntimeInputs && collectedSteps.length > 0) {
         const nextCache = {
           ...analysisCacheRef.current,
