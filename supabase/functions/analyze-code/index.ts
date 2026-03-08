@@ -21,38 +21,23 @@ serve(async (req) => {
     const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY is not configured");
 
-const systemPrompt = `You are an expert code execution analyzer. Analyze code line by line and return concise JSON very quickly.
+    const systemPrompt = `You are a fast code execution tracer. Trace the given code line by line and output results as NDJSON (one JSON object per line, no markdown, no extra text).
 
-Return a JSON object with this structure:
-{
-  "steps": [
-    {
-      "step": 1,
-      "line": <line number in the code>,
-      "code": "<the exact code on this line>",
-      "description": "<very short summary (max 12 words)>",
-      "purpose": "<one short sentence>",
-      "importance": "<one short sentence>",
-      "whatIfRemoved": "<one short sentence>",
-      "concept": "<very short concept label>",
-      "variables": { "<varName>": "<current value>", ... }
-    }
-  ],
-  "output": "<the complete final program output as a string>"
-}
+Each execution step must be on its own line in this exact format:
+{"step":1,"line":2,"code":"exact source line","description":"short summary max 10 words","variables":{"varName":"value"}}
 
-CRITICAL RULES:
-1. Include all meaningful executable lines. Blank/comment-only lines are optional.
-2. For loops up to 8 iterations: include all. For longer loops: include first 2, one middle, and last 2.
-3. For user input code (input/scanf/readline/prompt/Scanner/cin, etc.):
-   - If runtime input values are provided by the client, you MUST use those exact values in order.
-   - If no values are provided, simulate realistic inputs and clearly mention assumptions in output.
-4. The "variables" object should include key live variables and values.
-5. Keep each text field concise and specific.
-6. Maximum 22 steps.
-7. NEVER invent alternate input values (example: if provided value is "Lokis", do not output "Alice").
-8. Prefer compact wording and avoid redundant narrative.
-9. Return ONLY valid JSON. No markdown. No code blocks. No extra text.`;
+After ALL steps, output ONE final line:
+{"output":"complete program output string"}
+
+RULES:
+- One JSON per line. No markdown. No code fences. No extra text.
+- Max 20 steps total.
+- Descriptions: max 10 words, specific to what that line does.
+- variables: snapshot of all live variables AFTER this line executes.
+- For loops with >8 iterations: show first 2, one middle, last 2 iterations only.
+- For runtime inputs: use provided values in sequence order. If none provided, simulate realistic values.
+- Skip blank lines and comment-only lines.
+- Output line at the very end (after all steps).`;
 
     const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
       method: "POST",
@@ -61,49 +46,15 @@ CRITICAL RULES:
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
+        model: "google/gemini-2.0-flash",
         messages: [
           { role: "system", content: systemPrompt },
           {
             role: "user",
-            content: `Language: ${language}\n\nCode:\n${code}\n\nRuntime Inputs (use exactly if provided):\n${JSON.stringify(runtimeInputs || {})}\n\nRuntime Input Sequence (first input call gets first value, and so on):\n${JSON.stringify(runtimeInputSequence || [])}`,
+            content: `Language: ${language}\n\nCode:\n${code}\n\nRuntime Inputs (use in order): ${JSON.stringify(runtimeInputSequence || [])}\nInput Map: ${JSON.stringify(runtimeInputs || {})}`,
           },
         ],
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: "return_analysis",
-              description: "Return the step-by-step code execution analysis",
-              parameters: {
-                type: "object",
-                properties: {
-                  steps: {
-                    type: "array",
-                    items: {
-                      type: "object",
-                      properties: {
-                        step: { type: "number" },
-                        line: { type: "number" },
-                        code: { type: "string" },
-                        description: { type: "string" },
-                        purpose: { type: "string" },
-                        importance: { type: "string" },
-                        whatIfRemoved: { type: "string" },
-                        concept: { type: "string" },
-                        variables: { type: "object" },
-                      },
-                      required: ["step", "line", "code", "description", "purpose", "importance", "whatIfRemoved", "concept", "variables"],
-                    },
-                  },
-                  output: { type: "string" },
-                },
-                required: ["steps", "output"],
-              },
-            },
-          },
-        ],
-        tool_choice: { type: "function", function: { name: "return_analysis" } },
+        stream: true,
         temperature: 0.1,
       }),
     });
@@ -126,21 +77,9 @@ CRITICAL RULES:
       });
     }
 
-    const data = await response.json();
-    const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
-
-    let result;
-    if (toolCall?.function?.arguments) {
-      result = typeof toolCall.function.arguments === "string"
-        ? JSON.parse(toolCall.function.arguments)
-        : toolCall.function.arguments;
-    } else {
-      const content = data.choices?.[0]?.message?.content || "";
-      result = JSON.parse(content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim());
-    }
-
-    return new Response(JSON.stringify(result), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    // Pipe the raw SSE stream straight to the client — frontend parses NDJSON from content tokens
+    return new Response(response.body, {
+      headers: { ...corsHeaders, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
     });
   } catch (e) {
     console.error("analyze-code error:", e);

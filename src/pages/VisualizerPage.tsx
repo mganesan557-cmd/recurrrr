@@ -1,4 +1,7 @@
 import { useState, useRef, useEffect } from "react";
+
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string;
 import { useSearchParams, useNavigate } from "react-router-dom";
 import { Play, Eye, ChevronDown, Terminal, Cpu, Loader2, Target, Lightbulb, BookOpen, ChevronRight, Code2, MessageSquare, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -55,23 +58,25 @@ const VISUALIZER_STATE_KEY = "visualizer-state-v1";
 const VISUALIZER_CACHE_KEY = "visualizer-analysis-cache-v1";
 const VISUALIZER_CACHE_LIMIT = 20;
 
+const normalizeStep = (item: unknown, fallbackIndex: number): Step => {
+  const step = (item as Partial<Step>) || {};
+  return {
+    step: typeof step.step === "number" ? step.step : fallbackIndex + 1,
+    line: typeof step.line === "number" ? step.line : 0,
+    code: step.code,
+    description: step.description || "",
+    purpose: step.purpose,
+    importance: step.importance,
+    whatIfRemoved: step.whatIfRemoved,
+    concept: step.concept,
+    explanation: step.explanation,
+    variables: step.variables && typeof step.variables === "object" ? step.variables : {},
+  };
+};
+
 const normalizeSteps = (rawSteps: unknown): Step[] => {
   if (!Array.isArray(rawSteps)) return [];
-  return rawSteps.map((item, index) => {
-    const step = (item as Partial<Step>) || {};
-    return {
-      step: typeof step.step === "number" ? step.step : index + 1,
-      line: typeof step.line === "number" ? step.line : 0,
-      code: step.code,
-      description: step.description || "",
-      purpose: step.purpose,
-      importance: step.importance,
-      whatIfRemoved: step.whatIfRemoved,
-      concept: step.concept,
-      explanation: step.explanation,
-      variables: step.variables && typeof step.variables === "object" ? step.variables : {},
-    };
-  });
+  return rawSteps.map((item, index) => normalizeStep(item, index));
 };
 
 const detectRuntimeInputRequests = (language: string, code: string): RuntimeInputRequest[] => {
@@ -381,33 +386,125 @@ const VisualizerPage = () => {
         return;
       }
 
-      const { data, error } = await supabase.functions.invoke("analyze-code", {
-        body: {
+      // ── Streaming fetch: steps appear one-by-one as the AI generates them ──
+      const { data: { session } } = await supabase.auth.getSession();
+      const authToken = session?.access_token ?? SUPABASE_ANON_KEY;
+
+      const response = await fetch(`${SUPABASE_URL}/functions/v1/analyze-code`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${authToken}`,
+          "apikey": SUPABASE_ANON_KEY,
+        },
+        body: JSON.stringify({
           code,
           language,
           runtimeInputs: resolvedRuntimeInputs,
           runtimeInputSequence: Object.values(resolvedRuntimeInputs),
-        },
+        }),
       });
 
-      if (error) throw new Error(error.message);
-      if (data?.error) {
-        toast.error(data.error);
+      if (!response.ok || !response.body) {
+        // Try to parse error JSON
+        const errText = await response.text().catch(() => "Analysis failed");
+        let errMsg = "Analysis failed";
+        try { errMsg = (JSON.parse(errText) as { error?: string }).error ?? errMsg; } catch { /* */ }
+        if (response.status === 429) errMsg = "Rate limit exceeded, please try again later.";
+        if (response.status === 402) errMsg = "Usage limit reached. Please add credits.";
+        toast.error(errMsg);
+        setOutput(`Error: ${errMsg}`);
         setRunning(false);
         return;
       }
 
-      const analysisSteps: Step[] = normalizeSteps(data.steps);
-      const analysisOutput: string = data.output || "";
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      // sseBuf accumulates raw SSE bytes; ndjsonBuf accumulates extracted content tokens
+      let sseBuf = "";
+      let ndjsonBuf = "";
+      const collectedSteps: Step[] = [];
+      let collectedOutput = "";
+      let stepCount = 0;
 
-      setSteps(analysisSteps);
-      setActiveStep(analysisSteps.length ? analysisSteps.length - 1 : null);
-      setOutput(analysisOutput);
+      outer: while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      if (!hasRuntimeInputs) {
+        sseBuf += decoder.decode(value, { stream: true });
+        // SSE lines are separated by \n
+        const sseLines = sseBuf.split("\n");
+        sseBuf = sseLines.pop() ?? "";
+
+        for (const sseLine of sseLines) {
+          if (!sseLine.startsWith("data: ")) continue;
+          const payload = sseLine.slice(6).trim();
+          if (payload === "[DONE]") break outer;
+
+          try {
+            const parsed = JSON.parse(payload) as { choices?: Array<{ delta?: { content?: string }; finish_reason?: string }> };
+            // Check for error in SSE payload
+            if ((parsed as unknown as { error?: { message?: string } }).error) {
+              const sseErr = (parsed as unknown as { error: { message?: string } }).error.message ?? "AI error";
+              toast.error(sseErr);
+              setOutput(`Error: ${sseErr}`);
+              break outer;
+            }
+            const token = parsed.choices?.[0]?.delta?.content;
+            if (!token) continue;
+
+            ndjsonBuf += token;
+
+            // Extract complete NDJSON lines from the buffer
+            const ndjsonLines = ndjsonBuf.split("\n");
+            ndjsonBuf = ndjsonLines.pop() ?? "";
+
+            for (const ndjsonLine of ndjsonLines) {
+              const trimmed = ndjsonLine.trim();
+              if (!trimmed) continue;
+              try {
+                const obj = JSON.parse(trimmed) as Record<string, unknown>;
+                if ("output" in obj) {
+                  collectedOutput = String(obj.output ?? "");
+                  setOutput(collectedOutput);
+                } else if ("step" in obj || "line" in obj) {
+                  const s = normalizeStep(obj, stepCount++);
+                  collectedSteps.push(s);
+                  // Add step immediately — UI updates progressively
+                  setSteps((prev) => [...prev, s]);
+                  setActiveStep(collectedSteps.length - 1);
+                }
+              } catch {
+                // Incomplete/malformed JSON line — skip
+              }
+            }
+          } catch {
+            // Malformed SSE chunk — skip
+          }
+        }
+      }
+
+      // Flush any remaining buffered NDJSON content
+      if (ndjsonBuf.trim()) {
+        try {
+          const obj = JSON.parse(ndjsonBuf.trim()) as Record<string, unknown>;
+          if ("output" in obj) {
+            collectedOutput = String(obj.output ?? "");
+            setOutput(collectedOutput);
+          } else if ("step" in obj || "line" in obj) {
+            const s = normalizeStep(obj, stepCount++);
+            collectedSteps.push(s);
+            setSteps((prev) => [...prev, s]);
+            setActiveStep(collectedSteps.length - 1);
+          }
+        } catch { /* */ }
+      }
+
+      // Persist to local cache (cache-miss path only)
+      if (!hasRuntimeInputs && collectedSteps.length > 0) {
         const nextCache = {
           ...analysisCacheRef.current,
-          [cacheKey]: { steps: analysisSteps, output: analysisOutput },
+          [cacheKey]: { steps: collectedSteps, output: collectedOutput },
         };
         const entries = Object.entries(nextCache);
         if (entries.length > VISUALIZER_CACHE_LIMIT) {
@@ -416,12 +513,9 @@ const VisualizerPage = () => {
         } else {
           analysisCacheRef.current = nextCache;
         }
-
         try {
           localStorage.setItem(VISUALIZER_CACHE_KEY, JSON.stringify(analysisCacheRef.current));
-        } catch {
-          // Ignore storage quota errors.
-        }
+        } catch { /* storage quota */ }
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Analysis failed";
